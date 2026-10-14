@@ -1,0 +1,123 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aicode_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: aicode_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d aicode_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend_db_net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aicode_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DB_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/aicode_db
+      JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret_change_in_production_key_random_32_bytes}
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 1440
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      JUDGE0_URL: ${JUDGE0_URL:-http://judge0-server:2358}
+      CORS_ORIGINS: http://localhost:5173,http://localhost:5174,http://localhost:3000,http://localhost:80,http://localhost,http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:3000
+    volumes:
+      - ./docs:/docs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - public_frontend_net
+      - backend_db_net
+      - judge0_sandbox_net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:8000
+    container_name: aicode_frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - public_frontend_net
+
+  # =========================================================================
+  # Judge0 Sandbox Execution Engine
+  # Isolated on private internal Docker network (judge0_sandbox_net).
+  # NOT reachable from frontend or public internet. Reachable ONLY from backend.
+  # =========================================================================
+  judge0-server:
+    image: judge0/judge0:1.13.1
+    container_name: aicode_judge0
+    restart: unless-stopped
+    # Exposed internally to judge0_sandbox_net ONLY — no host port mapping (no 0.0.0.0 binding)
+    expose:
+      - "2358"
+    environment:
+      # --- Sandbox Network Isolation ---
+      - ENABLE_NETWORK=false                    # Disable network access inside execution isolate boxes
+      - JUDGE0_ENABLE_NETWORK=false             # Strict no-network policy for untrusted code
+      
+      # --- Sandbox User & Privileges ---
+      - RUN_AS_ROOT=false                       # Execute code as unprivileged sandbox box user
+      
+      # --- CPU & Time Constraints ---
+      - CPU_TIME_LIMIT=2.0                      # Default CPU time limit in seconds
+      - MAX_CPU_TIME_LIMIT=15.0                 # Hard maximum CPU time limit in seconds
+      - WALL_TIME_LIMIT=5.0                     # Default wall-clock timeout in seconds
+      - MAX_WALL_TIME_LIMIT=20.0                # Hard maximum wall-clock timeout in seconds
+      - MAX_ENABLE_PER_PROCESS_AND_THREAD_TIME_LIMIT=true
+      
+      # --- Memory & Resource Constraints ---
+      - MEMORY_LIMIT=262144                     # Default memory limit in KB (256 MB)
+      - MAX_MEMORY_LIMIT=524288                 # Hard maximum memory limit in KB (512 MB)
+      - MAX_STACK_LIMIT=128000                  # Max stack size limit in KB (128 MB)
+      - MAX_ENABLE_PER_PROCESS_AND_THREAD_MEMORY_LIMIT=true
+      
+      # --- Process & Output Throttling ---
+      - MAX_MAX_PROCESSES_AND_OR_THREADS=60     # Fork bomb prevention: cap total processes/threads
+      - MAX_FILE_SIZE_LIMIT=4096                # Max file output limit in KB (4 MB)
+      - MAX_NUMBER_OF_RUNS=1
+      - JUDGE0_ALLOW_ORIGIN=*
+    privileged: true                            # Required for Linux kernel isolate cgroups & namespaces
+    networks:
+      - judge0_sandbox_net
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  # Network 1: Public web traffic between Browser -> Frontend & Backend API
+  public_frontend_net:
+    driver: bridge
+
+  # Network 2: Internal database network between Backend and PostgreSQL
+  backend_db_net:
+    driver: bridge
+
+  # Network 3: Isolated sandbox network between Backend and Judge0 execution engine
+  # Internal network with no default gateway / external internet egress
+  judge0_sandbox_net:
+    driver: bridge
+    internal: true
